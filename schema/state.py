@@ -1,4 +1,4 @@
-from typing import Annotated, List, TypedDict
+from typing import Annotated, Any, Dict, List, TypedDict
 from langgraph.graph.message import add_messages
 
 class AgentState(TypedDict):
@@ -6,8 +6,8 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     
     # Datos de negocio
-    raw_news: List[dict]         # Lo que encuentra el Collector
-    analyzed_news: List[dict]    # Lo que procesa el Analyst
+    raw_news: List[Dict[str, Any]]      # Noticias brutas de la DB
+    analyzed_news: List[Dict[str, Any]] # Noticias con el JSON de la IA + source + link
     reports: List[dict]          # Lo que escribe el Writer
     
     # Control de flujo
