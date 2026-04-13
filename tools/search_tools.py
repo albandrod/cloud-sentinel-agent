@@ -1,35 +1,98 @@
 import requests
 import re
-import time
 import hashlib
 import feedparser
-from typing import List, Dict
-from datetime import datetime, timezone
-from bs4 import BeautifulSoup
-from dateutil import parser as date_parser
+import time
+import warnings
+import logging
+from typing import List, Dict, Optional
+from datetime import datetime, timezone, timedelta
+from bs4 import BeautifulSoup, GuessedAtParserWarning
 from langchain_core.tools import tool
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- UTILIDADES COMUNES ---
+_CACHE = {}
+_CACHE_TTL = 300  # segundos
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("search_tools")
+
+# Silenciamos avisos de BeautifulSoup para mantener el log limpio
+warnings.filterwarnings("ignore", category=GuessedAtParserWarning)
+
+# --- UTILIDADES DE PROCESAMIENTO DINÁMICO ---
+
+def is_within_time_window(published_parsed, days: int = 3) -> bool:
+    """Verifica si la entrada está dentro de la ventana de días solicitada."""
+    if not published_parsed:
+        return True  # Por precaución procesamos si no hay fecha
+    
+    # Convertir struct_time a objeto datetime UTC
+    dt_published = datetime.fromtimestamp(time.mktime(published_parsed), tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    return dt_published > (now - timedelta(days=days))
 
 def clean_html_content(html: str) -> str:
-    """Limpia el HTML y devuelve texto plano legible."""
-    if not html: return ""
-    soup = BeautifulSoup(html, "html.parser")
-    for el in soup(["script", "style", "img", "iframe", "figure", "header", "footer"]):
-        el.decompose()
-    text = soup.get_text(separator=' ')
-    return re.sub(r'\s+', ' ', text).strip()
+    """Limpia el HTML evitando errores de rutas de archivos y avisos innecesarios."""
+    if not html or not isinstance(html, str) or len(html.strip()) < 5:
+        return ""
+    
+    # CCOE Guard: Evita parsear strings que parecen rutas o enlaces
+    if html.strip().startswith(('http', 'C:', '/', '\\', 'ftp')):
+        return html.strip()
 
-def generate_hash(text: str) -> str:
-    """Genera un hash único basado en el contenido para evitar duplicados."""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for el in soup(["script", "style", "img", "iframe", "figure", "header", "footer", "nav"]):
+            el.decompose()
+        
+        text = soup.get_text(separator=' ')
+        return re.sub(r'\s+', ' ', text).strip()
+    except Exception:
+        return re.sub('<[^<]+?>', '', html).strip()
+
+def generate_hash(text: str, date: str = None) -> str:
+    """Genera un identificador único MD5 para control de duplicados."""
+    if date:
+        return hashlib.md5(f"{text}|{date}".encode('utf-8')).hexdigest()
     return hashlib.md5(text.encode('utf-8')).hexdigest()
 
-# --- CLASES COLECTORAS ---
+# --- CLASES COLECTORAS (MULTI-CLOUD REFORZADAS) ---
+
+def _cache_get(key):
+    entry = _CACHE.get(key)
+    if entry and (time.time() - entry['ts'] < _CACHE_TTL):
+        return entry['data']
+    return None
+
+def _cache_set(key, data):
+    _CACHE[key] = {'data': data, 'ts': time.time()}
+
+def _validate_news_item(item: Dict) -> Optional[Dict]:
+    # Limpieza y validación básica
+    title = item.get('title', '').strip()
+    link = item.get('link', '').strip()
+    body = item.get('body', '').strip()
+    content_hash = item.get('content_hash', '').strip()
+    if not title or not link or not content_hash:
+        return None
+    item['title'] = title[:300]
+    item['link'] = link
+    item['body'] = body
+    item['content_hash'] = content_hash
+    return item
+
+def _filter_and_paginate(news: List[Dict], search: Optional[str] = None, page: int = 1, page_size: int = 50) -> List[Dict]:
+    filtered = news
+    if search:
+        search = search.lower()
+        filtered = [n for n in news if search in n.get('title', '').lower() or search in n.get('body', '').lower()]
+    start = (page-1)*page_size
+    end = start + page_size
+    return filtered[start:end]
 
 class AzureCollector:
     URLS = [
     "https://www.microsoft.com/releasecommunications/api/v2/azure/rss",
-    "https://github.com/Azure/AKS/releases.atom",
     "https://status.azure.com/en-us/status/feed/",
     "https://techcommunity.microsoft.com/t5/s/gxcuf89792/rss/board?board.id=AzureDBSupport",
     "https://techcommunity.microsoft.com/t5/s/gxcuf89792/rss/board?board.id=azure-ai-foundry-blog",
@@ -55,33 +118,67 @@ class AzureCollector:
 ]
 
     @classmethod
-    def fetch_all(cls) -> List[Dict]:
+    def fetch_all(cls, days: int = 5, search: Optional[str] = None, page: int = 1, page_size: int = 50) -> List[Dict]:
+        # Cambia el parámetro 'days' aquí para ajustar la ventana de ingestión histórica (por defecto: 5 días)
+        cache_key = f"azure_{days}"
+        cached = _cache_get(cache_key)
+        if cached:
+            logger.info("AzureCollector: usando caché.")
+            return _filter_and_paginate(cached, search, page, page_size)
         all_news = []
-        headers = {"User-Agent": "cloud-sentinel-agent/3.0"}
-        for url in cls.URLS:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/rss+xml, application/xml, text/xml"
+        }
+        def fetch_url(url):
             try:
-                r = requests.get(url, timeout=20, headers=headers)
-                r.raise_for_status()
-                soup = BeautifulSoup(r.text, "xml")
-                items = soup.find_all(["item", "entry"])
-                for item in items:
-                    title = item.find("title").get_text() if item.find("title") else "N/A"
-                    link_tag = item.find("link")
-                    link = (link_tag.get("href") or link_tag.get_text()) if link_tag else ""
-                    desc_tag = item.find(["description", "summary", "content"])
-                    body = clean_html_content(desc_tag.get_text() if desc_tag else "")
-                    
-                    all_news.append({
+                logger.info(f"[AzureCollector] Intentando fetch: {url}")
+                response = requests.get(url, headers=headers, timeout=10)
+                logger.info(f"[AzureCollector] Respuesta HTTP: {response.status_code} para {url}")
+                if response.status_code != 200:
+                    logger.error(f"[AzureCollector] Feed {url} status code: {response.status_code}")
+                    return []
+                feed = feedparser.parse(response.content)
+                logger.info(f"[AzureCollector] Feed {url} - {len(feed.entries)} items encontrados.")
+                items = []
+                for entry in feed.entries:
+                    pub_date = entry.get('published', None)
+                    pub_parsed = entry.get('published_parsed', None)
+                    logger.info(f"[AzureCollector] Feed {url} - Item: '{entry.get('title', '')[:60]}' Fecha: {pub_date} Parsed: {pub_parsed}")
+                    if not is_within_time_window(pub_parsed, days=days):
+                        logger.info(f"[AzureCollector] Feed {url} - DESCARTADO por fecha: {pub_date}")
+                        continue
+                    title = entry.get('title', 'Sin título')
+                    link = entry.get('link', '')
+                    raw_content = entry.content[0].value if 'content' in entry else entry.get('summary', '')
+                    body = clean_html_content(raw_content)
+                    published_at = entry.get('published', datetime.now(timezone.utc).isoformat())
+                    item = {
                         "source": "azure",
                         "title": title[:300],
                         "link": link,
                         "body": body,
-                        "content_hash": generate_hash(body),
-                        "published_at": datetime.now(timezone.utc).isoformat()
-                    })
+                        "content_hash": generate_hash(body if body else title, published_at),
+                        "published_at": published_at,
+                        "published_date": datetime.fromtimestamp(time.mktime(pub_parsed)).isoformat() if pub_parsed else None
+                    }
+                    valid = _validate_news_item(item)
+                    if valid:
+                        items.append(valid)
+                logger.info(f"[AzureCollector] Feed {url} - {len(items)} items válidos tras filtrado.")
+                return items
             except Exception as e:
-                print(f"Error en Azure {url}: {e}")
-        return all_news
+                logger.error(f"[AzureCollector] ERROR en fetch_url para {url}: {type(e).__name__}: {e}", exc_info=True)
+                return []
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = [executor.submit(fetch_url, url) for url in cls.URLS]
+            for future in as_completed(futures):
+                all_news.extend(future.result())
+        # Elimina duplicados por hash
+        unique = {n['content_hash']: n for n in all_news}
+        result = list(unique.values())
+        _cache_set(cache_key, result)
+        return _filter_and_paginate(result, search, page, page_size)
 
 class AWSCollector:
     URLS = [
@@ -94,43 +191,70 @@ class AWSCollector:
     "https://aws.amazon.com/blogs/database/feed/",
     "https://aws.amazon.com/blogs/storage/feed/",
     "https://aws.amazon.com/blogs/mt/feed/",
-    "https://aws.amazon.com/blogs/opensource/feed/",
     "https://status.aws.amazon.com/rss/all.rss",
     "https://cloudonaut.io/index.xml",
     "https://theburningmonk.com/feed/",
     "https://www.lastweekinaws.com/feed/",
-    "https://github.com/aws/aws-cdk/releases.atom",
-    "https://github.com/boto/boto3/releases.atom",
     "https://lucvandonkersgoed.com/feed/",
-    "https://github.com/aws/aws-cli/releases.atom",
     "https://www.jeremydaly.com/feed/",
     "https://advancedweb.hu/rss.xml"
 ]
 
     @classmethod
-    def fetch_all(cls) -> List[Dict]:
+    def fetch_all(cls, days: int = 5, search: Optional[str] = None, page: int = 1, page_size: int = 50) -> List[Dict]:
+        # Cambia el parámetro 'days' aquí para ajustar la ventana de ingestión histórica (por defecto: 5 días)
+        cache_key = f"aws_{days}"
+        cached = _cache_get(cache_key)
+        if cached:
+            logger.info("AWSCollector: usando caché.")
+            return _filter_and_paginate(cached, search, page, page_size)
         all_news = []
-        for url in cls.URLS:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        def fetch_url(url):
             try:
-                feed = feedparser.parse(url)
+                logger.info(f"[AWSCollector] Intentando fetch: {url}")
+                response = requests.get(url, headers=headers, timeout=10)
+                logger.info(f"[AWSCollector] Respuesta HTTP: {response.status_code} para {url}")
+                if response.status_code != 200:
+                    logger.error(f"[AWSCollector] Feed {url} status code: {response.status_code}")
+                    return []
+                feed = feedparser.parse(response.content)
+                logger.info(f"[AWSCollector] Feed {url} - {len(feed.entries)} items encontrados.")
+                items = []
                 for entry in feed.entries:
+                    if not is_within_time_window(entry.get('published_parsed'), days=days):
+                        logger.info(f"[AWSCollector] Feed {url} - DESCARTADO por fecha: {entry.get('published', None)}")
+                        continue
                     title = entry.get('title', 'Sin título')
                     link = entry.get('link', '')
                     content_list = entry.get('content', [])
                     raw_text = content_list[0].value if content_list else entry.get('summary', "")
                     body = clean_html_content(raw_text)
-                    
-                    all_news.append({
+                    published_at = entry.get('published', datetime.now(timezone.utc).isoformat())
+                    item = {
                         "source": "aws",
                         "title": title[:300],
                         "link": link,
                         "body": body,
-                        "content_hash": generate_hash(body),
-                        "published_at": datetime.now(timezone.utc).isoformat()
-                    })
+                        "content_hash": generate_hash(body if body else title, published_at),
+                        "published_at": published_at,
+                        "published_date": datetime.fromtimestamp(time.mktime(entry.published_parsed)).isoformat() if entry.get('published_parsed') else None
+                    }
+                    valid = _validate_news_item(item)
+                    if valid:
+                        items.append(valid)
+                return items
             except Exception as e:
-                print(f"Error en AWS {url}: {e}")
-        return all_news
+                logger.error(f"[AWSCollector] ERROR en fetch_url para {url}: {type(e).__name__}: {e}", exc_info=True)
+                return []
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = [executor.submit(fetch_url, url) for url in cls.URLS]
+            for future in as_completed(futures):
+                all_news.extend(future.result())
+        unique = {n['content_hash']: n for n in all_news}
+        result = list(unique.values())
+        _cache_set(cache_key, result)
+        return _filter_and_paginate(result, search, page, page_size)
 
 class GCPCollector:
     URLS = [
@@ -145,43 +269,74 @@ class GCPCollector:
 ]
 
     @classmethod
-    def fetch_all(cls) -> List[Dict]:
+    def fetch_all(cls, days: int = 5, search: Optional[str] = None, page: int = 1, page_size: int = 50) -> List[Dict]:
+        # Cambia el parámetro 'days' aquí para ajustar la ventana de ingestión histórica (por defecto: 5 días)
+        cache_key = f"gcp_{days}"
+        cached = _cache_get(cache_key)
+        if cached:
+            logger.info("GCPCollector: usando caché.")
+            return _filter_and_paginate(cached, search, page, page_size)
         all_news = []
-        for url in cls.URLS:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        def fetch_url(url):
             try:
-                feed = feedparser.parse(url)
+                logger.info(f"[GCPCollector] Intentando fetch: {url}")
+                response = requests.get(url, headers=headers, timeout=10)
+                logger.info(f"[GCPCollector] Respuesta HTTP: {response.status_code} para {url}")
+                if response.status_code != 200:
+                    logger.error(f"[GCPCollector] Feed {url} status code: {response.status_code}")
+                    return []
+                feed = feedparser.parse(response.content)
+                logger.info(f"[GCPCollector] Feed {url} - {len(feed.entries)} items encontrados.")
+                items = []
                 for entry in feed.entries:
+                    if not is_within_time_window(entry.get('published_parsed'), days=days):
+                        logger.info(f"[GCPCollector] Feed {url} - DESCARTADO por fecha: {entry.get('published', None)}")
+                        continue
                     title = entry.get('title', 'Sin título')
                     link = entry.get('link', '')
                     content_list = entry.get('content', [])
                     raw_text = content_list[0].value if content_list else entry.get('summary', "")
                     body = clean_html_content(raw_text)
-                    
-                    all_news.append({
+                    published_at = entry.get('published', datetime.now(timezone.utc).isoformat())
+                    item = {
                         "source": "gcp",
                         "title": title[:300],
                         "link": link,
                         "body": body,
-                        "content_hash": generate_hash(body),
-                        "published_at": datetime.now(timezone.utc).isoformat()
-                    })
+                        "content_hash": generate_hash(body if body else title, published_at),
+                        "published_at": published_at,
+                        "published_date": datetime.fromtimestamp(time.mktime(entry.published_parsed)).isoformat() if entry.get('published_parsed') else None
+                    }
+                    valid = _validate_news_item(item)
+                    if valid:
+                        items.append(valid)
+                return items
             except Exception as e:
-                print(f"Error en GCP {url}: {e}")
-        return all_news
+                logger.error(f"[GCPCollector] ERROR en fetch_url para {url}: {type(e).__name__}: {e}", exc_info=True)
+                return []
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = [executor.submit(fetch_url, url) for url in cls.URLS]
+            for future in as_completed(futures):
+                all_news.extend(future.result())
+        unique = {n['content_hash']: n for n in all_news}
+        result = list(unique.values())
+        _cache_set(cache_key, result)
+        return _filter_and_paginate(result, search, page, page_size)
 
-# --- TOOLS PARA EL AGENTE (EXPOSED) ---
-
-@tool
-def get_azure_updates() -> List[Dict]:
-    """Consulta feeds oficiales de Azure. Devuelve noticias con hash de contenido."""
-    return AzureCollector.fetch_all()
-
-@tool
-def get_aws_updates() -> List[Dict]:
-    """Consulta feeds oficiales de AWS. Devuelve noticias con hash de contenido."""
-    return AWSCollector.fetch_all()
+# --- TOOLS EXPORTADAS ---
 
 @tool
-def get_gcp_updates() -> List[Dict]:
-    """Consulta feeds oficiales de GCP. Devuelve noticias con hash de contenido."""
-    return GCPCollector.fetch_all()
+def get_azure_updates(days: int = 3, search: Optional[str] = None, page: int = 1, page_size: int = 50) -> List[Dict]:
+    """Consulta novedades de Azure. Soporta días, búsqueda, paginación."""
+    return AzureCollector.fetch_all(days=days, search=search, page=page, page_size=page_size)
+
+@tool
+def get_aws_updates(days: int = 3, search: Optional[str] = None, page: int = 1, page_size: int = 50) -> List[Dict]:
+    """Consulta novedades de AWS. Soporta días, búsqueda, paginación."""
+    return AWSCollector.fetch_all(days=days, search=search, page=page, page_size=page_size)
+
+@tool
+def get_gcp_updates(days: int = 3, search: Optional[str] = None, page: int = 1, page_size: int = 50) -> List[Dict]:
+    """Consulta novedades de GCP. Soporta días, búsqueda, paginación."""
+    return GCPCollector.fetch_all(days=days, search=search, page=page, page_size=page_size)

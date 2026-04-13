@@ -4,7 +4,32 @@ Sistema automatizado para la vigilancia, análisis y generación de informes sob
 
 ## Objetivo
 
+
 Automatizar la obtención, filtrado, análisis y redacción de informes profesionales sobre noticias relevantes de la nube, facilitando la monitorización de cambios técnicos, alertas de seguridad, novedades de arquitectura, costes y fin de vida (EOL) de servicios.
+
+## Instalación y dependencias
+
+1. **Clona el repositorio y accede a la carpeta:**
+  ```bash
+  git clone https://github.com/albandrod/cloud-sentinel-agent.git
+  cd cloud-sentinel-agent
+  ```
+2. **Crea un entorno virtual (opcional pero recomendado):**
+  ```bash
+  python -m venv .venv
+  source .venv/bin/activate  # En Windows: .venv\Scripts\activate
+  ```
+3. **Instala las dependencias:**
+  ```bash
+  pip install -r requirements.txt
+  ```
+
+## Troubleshooting rápido
+
+- Si ves errores como `Import "feedparser" could not be resolved`, asegúrate de instalar todas las dependencias con el comando anterior.
+- Si usas Azure OpenAI, configura las variables de entorno necesarias (`AZURE_OPENAI_API_KEY`, etc).
+- Para problemas con SQLite, asegúrate de tener permisos de escritura en la carpeta del proyecto.
+
 
 ## Arquitectura
 
@@ -37,7 +62,7 @@ Automatizar la obtención, filtrado, análisis y redacción de informes profesio
 ## Ejemplo de Uso
 
 1. Ejecuta el orquestador principal:
-   ```
+  ```bash
    python main.py
    ```
 2. El sistema verifica si hay noticias pendientes; si no, lanza el Collector.

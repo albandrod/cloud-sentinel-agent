@@ -1,0 +1,21 @@
+
+# Dependencias principales
+requests
+feedparser
+beautifulsoup4
+langchain-core
+langchain-openai
+langgraph
+python-dotenv
+
+# Generación de informes Markdown/PDF
+markdown2
+fpdf
+pdfkit
+
+# Dependencias opcionales (comentadas)
+# python-dateutil
+# sqlite3  # Incluido en stdlib
+# json     # Incluido en stdlib
+
+# NOTA: Si usas Azure OpenAI, asegúrate de tener configurado el acceso y credenciales.
